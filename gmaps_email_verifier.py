@@ -1,291 +1,205 @@
 #!/usr/bin/env python3
 """
-gmaps_email_verifier.py
-Google Maps → Website → Email extraction → Verification
-Selenium fixed using webdriver-manager (ChromeDriver auto sync)
+email_extractor_verifier.py
+
+Extract emails from website URLs and verify them using:
+- Syntax check
+- MX record check
+- Optional SMTP ping (no email sent)
+
+Output: Excel (.xlsx)
+
+100% open-source, no Selenium, no Google Maps scraping.
 """
 
-import argparse
 import re
 import time
-import logging
 import socket
-import sys
-from urllib.parse import urlparse, urljoin
-from collections import deque
-
 import requests
-from bs4 import BeautifulSoup
 import pandas as pd
 import dns.resolver
 import smtplib
-import urllib.robotparser as robotparser
-
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-# Selenium (FIXED)
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
-
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+from collections import deque
 
 # ================= CONFIG =================
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-HEADERS = {"User-Agent": USER_AGENT}
-REQUEST_TIMEOUT = 15
-RATE_LIMIT_SECONDS = 2
-CRAWL_PAGE_LIMIT = 40
-CRAWL_DEPTH_LIMIT = 2
-SMTP_TIMEOUT = 10
-SMTP_PORT = 25
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; EmailExtractor/1.0)"
+}
+
+TIMEOUT = 15
+RATE_LIMIT = 1
+MAX_PAGES = 30
+CRAWL_DEPTH = 2
+SMTP_TIMEOUT = 8
 
 EMAIL_REGEX = re.compile(
-    r"[a-zA-Z0-9._%+\-']+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}",
-    re.I
+    r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}"
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("gmaps_email_verifier")
+# ================= HELPERS =================
 
-
-# ================= REQUEST SESSION =================
-session = requests.Session()
-retries = Retry(total=3, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
-session.mount("https://", HTTPAdapter(max_retries=retries))
-session.mount("http://", HTTPAdapter(max_retries=retries))
-
-
-def safe_get(url):
+def fetch(url):
     try:
-        time.sleep(RATE_LIMIT_SECONDS)
-        r = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        time.sleep(RATE_LIMIT)
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
         r.raise_for_status()
         return r.text
     except Exception:
         return None
 
+def extract_emails(html):
+    return set(EMAIL_REGEX.findall(html or ""))
 
-# ================= ROBOTS =================
-def is_allowed_by_robots(url):
-    try:
-        p = urlparse(url)
-        rp = robotparser.RobotFileParser()
-        rp.set_url(f"{p.scheme}://{p.netloc}/robots.txt")
-        rp.read()
-        return rp.can_fetch(USER_AGENT, url)
-    except Exception:
-        return True
+def same_domain(a, b):
+    return urlparse(a).netloc == urlparse(b).netloc
 
-
-# ================= GOOGLE MAPS (SELENIUM FIXED) =================
-def get_website_from_google_maps(url):
-    logger.info("Using Selenium for Google Maps extraction")
-
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-gpu")
-    options.add_argument(f"user-agent={USER_AGENT}")
-
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-
-    business_name = None
-    website = None
-
-    try:
-        driver.get(url)
-        time.sleep(5)
-
-        try:
-            business_name = driver.find_element(By.CSS_SELECTOR, "h1").text
-        except Exception:
-            pass
-
-        try:
-            website = driver.find_element(
-                By.CSS_SELECTOR,
-                'a[data-item-id="authority"]'
-            ).get_attribute("href")
-        except Exception:
-            pass
-
-    finally:
-        driver.quit()
-
-    if website:
-        logger.info("Found website: %s", website)
-    else:
-        logger.warning("Website not found on Maps page")
-
-    return business_name, website
-
-
-# ================= EMAIL EXTRACTION =================
-def extract_emails_from_html(html):
-    found = set()
+# ================= CRAWLER =================
+def is_skippable_html(html):
     if not html:
-        return found
+        return True
+    # Extremely short or binary-like responses
+    if len(html) < 200:
+        return True
+    return False
 
-    soup = BeautifulSoup(html, "html.parser")
-
-    for a in soup.select('a[href^="mailto:"]'):
-        mail = a.get("href").split("mailto:")[1].split("?")[0]
-        found.add(mail)
-
-    for m in EMAIL_REGEX.findall(html):
-        found.add(m)
-
-    return found
-
-
-def same_domain(u1, u2):
-    return urlparse(u1).netloc == urlparse(u2).netloc
-
-
-def crawl_site_for_emails(start_url):
-    if not is_allowed_by_robots(start_url):
-        return set(), {}
-
-    visited = set([start_url])
+def crawl_site(start_url):
+    visited = set()
     queue = deque([(start_url, 0)])
-    found = set()
-    sources = {}
+    results = []
 
-    while queue and len(visited) <= CRAWL_PAGE_LIMIT:
+    while queue:
         url, depth = queue.popleft()
-        html = safe_get(url)
-        if not html:
+        if url in visited or depth > CRAWL_DEPTH or len(visited) > MAX_PAGES:
             continue
 
-        emails = extract_emails_from_html(html)
-        for e in emails:
-            found.add(e)
-            sources.setdefault(e, url)
+        visited.add(url)
+        html = fetch(url)
 
-        if depth >= CRAWL_DEPTH_LIMIT:
+        # Skip broken / invalid pages
+        if is_skippable_html(html):
+            print(f"[!] Skipping bad page: {url}")
             continue
 
-        soup = BeautifulSoup(html, "html.parser")
+        # Extract emails safely
+        try:
+            emails = extract_emails(html)
+            for email in emails:
+                results.append((email, url))
+        except Exception:
+            print(f"[!] Email extraction failed: {url}")
+            continue
+
+        # Safe parsing with fallback
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+            except Exception:
+                print(f"[!] Skipping unparsable HTML: {url}")
+                continue
+
         for a in soup.find_all("a", href=True):
-            nxt = urljoin(url, a["href"])
-            if nxt.startswith("http") and same_domain(start_url, nxt):
-                if nxt not in visited:
-                    visited.add(nxt)
-                    queue.append((nxt, depth + 1))
+            try:
+                link = urljoin(url, a["href"])
+                if link.startswith("http") and same_domain(start_url, link):
+                    queue.append((link, depth + 1))
+            except Exception:
+                continue
 
-    return found, sources
+    return results
 
 
-# ================= EMAIL VERIFICATION =================
-def validate_syntax(email):
+# ================= VERIFICATION =================
+
+def syntax_valid(email):
     return bool(EMAIL_REGEX.fullmatch(email))
 
-
-def check_mx(domain):
+def mx_valid(domain):
     try:
-        answers = dns.resolver.resolve(domain, "MX")
-        return [str(r.exchange).rstrip(".") for r in answers]
+        dns.resolver.resolve(domain, "MX", lifetime=5)
+        return True
     except Exception:
-        return []
+        return False
 
-
-def smtp_verify(email):
+def smtp_check(email):
     domain = email.split("@")[1]
-    mxs = check_mx(domain)
-    if not mxs:
-        return "Invalid", "No MX"
+    try:
+        records = dns.resolver.resolve(domain, "MX")
+        mx = str(records[0].exchange).rstrip(".")
+        server = smtplib.SMTP(mx, 25, timeout=SMTP_TIMEOUT)
+        server.helo()
+        server.mail("test@example.com")
+        code, _ = server.rcpt(email)
+        server.quit()
 
-    for mx in mxs:
-        try:
-            smtp = smtplib.SMTP(mx, SMTP_PORT, timeout=SMTP_TIMEOUT)
-            smtp.helo()
-            smtp.mail("verify@example.com")
-            code, _ = smtp.rcpt(email)
-            smtp.quit()
+        if 200 <= code < 300:
+            return "Valid"
+        elif 400 <= code < 500:
+            return "Risky"
+        else:
+            return "Invalid"
+    except Exception:
+        return "Risky"
 
-            if 200 <= code < 300:
-                return "Valid", "SMTP OK"
-            if 400 <= code < 500:
-                return "Risky", "Temp failure"
-        except Exception:
+# ================= MAIN =================
+
+def process_urls(urls):
+    rows = []
+
+    for site in urls:
+        print(f"[+] Crawling {site}")
+        found = crawl_site(site)
+
+        if not found:
+            rows.append({
+                "Website URL": site,
+                "Page URL": "",
+                "Extracted Email": "",
+                "Syntax Valid": "No",
+                "MX Valid": "No",
+                "SMTP Check": "Skipped",
+                "Final Status": "Invalid"
+            })
             continue
 
-    return "Invalid", "Rejected"
+        for email, page in found:
+            syntax = syntax_valid(email)
+            mx = mx_valid(email.split("@")[1]) if syntax else False
+            smtp = smtp_check(email) if mx else "Skipped"
 
+            if syntax and mx and smtp == "Valid":
+                status = "Valid"
+            elif syntax and mx:
+                status = "Risky"
+            else:
+                status = "Invalid"
 
-# ================= MAIN PROCESS =================
-def process_gmaps_url(url):
-    rows = []
-    name, site = get_website_from_google_maps(url)
-
-    if not site:
-        rows.append({
-            "Business Name": name or "Unknown",
-            "Website URL": "",
-            "Extracted Email": "",
-            "Email Validity Status": "Invalid",
-            "Verification Method Used": "None",
-            "Source URL": url
-        })
-        return rows
-
-    emails, sources = crawl_site_for_emails(site)
-
-    if not emails:
-        rows.append({
-            "Business Name": name or "",
-            "Website URL": site,
-            "Extracted Email": "",
-            "Email Validity Status": "Invalid",
-            "Verification Method Used": "None",
-            "Source URL": site
-        })
-        return rows
-
-    for e in emails:
-        if not validate_syntax(e):
-            status, method = "Invalid", "Syntax"
-        else:
-            status, method = smtp_verify(e)
-
-        rows.append({
-            "Business Name": name or "",
-            "Website URL": site,
-            "Extracted Email": e,
-            "Email Validity Status": status,
-            "Verification Method Used": method,
-            "Source URL": sources.get(e, site)
-        })
+            rows.append({
+                "Website URL": site,
+                "Page URL": page,
+                "Extracted Email": email,
+                "Syntax Valid": "Yes" if syntax else "No",
+                "MX Valid": "Yes" if mx else "No",
+                "SMTP Check": smtp,
+                "Final Status": status
+            })
 
     return rows
 
+def load_urls(file):
+    with open(file, "r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
-# ================= CLI =================
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--input", required=True)
-    parser.add_argument("-o", "--output", default="gmaps_emails_verified.xlsx")
-    args = parser.parse_args()
-
-    with open(args.input) as f:
-        urls = [l.strip() for l in f if l.strip()]
-
-    all_rows = []
-    for u in urls:
-        all_rows.extend(process_gmaps_url(u))
-
-    df = pd.DataFrame(all_rows)
-    df.to_excel(args.output, index=False)
-    logger.info("Saved output to %s", args.output)
-
+    urls = load_urls("urls.txt")
+    data = process_urls(urls)
+    df = pd.DataFrame(data)
+    df.to_excel("emails_verified.xlsx", index=False)
+    print("\n✅ Saved: emails_verified.xlsx")
 
 if __name__ == "__main__":
     main()
